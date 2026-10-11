@@ -13,6 +13,7 @@
 #include <thread>
 #include <functional>
 #include <sys/time.h>
+#include <cerrno>
 
 using namespace std;
 
@@ -156,7 +157,19 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     while (request.find("\r\n\r\n") == string::npos && request.size() < 16384) {
         ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
 
-        if (n <= 0) {
+        if (n == 0) {
+            // Client closed the connection.
+            close(client_fd);
+            return;
+        }
+
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                cerr << "Client receive timeout\n";
+            } else {
+                perror("recv client");
+            }
+
             close(client_fd);
             return;
         }
