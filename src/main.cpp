@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <thread>
 #include <functional>
+#include <sys/time.h>
 
 using namespace std;
 
@@ -126,9 +127,31 @@ bool is_domain_blocked( const string& host, const unordered_set<string>& blocked
     return false;
 }
 
+
+bool set_socket_timeout(int fd, int seconds) {
+    timeval timeout{};
+    timeout.tv_sec = seconds;
+    timeout.tv_usec = 0;
+
+    return setsockopt(
+        fd,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        &timeout,
+        sizeof(timeout)
+    ) == 0;
+}
+
+
 void handle_client( int client_fd, const unordered_set<string>& blocked_domains ) {
     string request;
     char buffer[4096];
+    
+    if (!set_socket_timeout(client_fd, 10)) {
+    perror("setsockopt client");
+    close(client_fd);
+    return;
+    }
 
     while (request.find("\r\n\r\n") == string::npos && request.size() < 16384) {
         ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
@@ -205,6 +228,13 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
         send_all(client_fd, response);
         close(client_fd);
         return;
+    }
+
+    if (!set_socket_timeout(upstream_fd, 10)) {
+    perror("setsockopt upstream");
+    close(upstream_fd);
+    close(client_fd);
+    return;
     }
 
     string upstream_request =
