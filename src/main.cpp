@@ -292,6 +292,7 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
 queue<int> client_queue;
 mutex queue_mutex;
 condition_variable queue_cv;
+const size_t MAX_QUEUE_SIZE = 100;
 
 void worker(const unordered_set<string>& blocked_domains) {
     while (true) {
@@ -348,6 +349,13 @@ int main() {
     cout << "Loaded " << blocked_domains.size()
          << " blocked domains\n";
 
+    vector<thread> workers;
+
+    for (int i = 0; i < 4; i++) {
+        workers.emplace_back(worker, cref(blocked_domains));
+    }
+
+    
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
 
@@ -356,13 +364,12 @@ int main() {
             continue;
         }
 
-        thread client_thread(
-            handle_client,
-            client_fd,
-            cref(blocked_domains)
-        );
+        {
+            lock_guard<mutex> lock(queue_mutex);
+            client_queue.push(client_fd);
+        }
 
-        client_thread.detach();
+        queue_cv.notify_one();
     }
 
     close(server_fd);
