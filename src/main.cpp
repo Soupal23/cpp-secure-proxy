@@ -254,12 +254,26 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
         method + " " + path + " HTTP/1.1\r\n"
         "Host: " + host + "\r\n"
         "Connection: close\r\n\r\n";
-
+    
     if (send_all(upstream_fd, upstream_request)) {
         while (true) {
             ssize_t n = recv(upstream_fd, buffer, sizeof(buffer), 0);
 
-            if (n <= 0) break;
+            if (n == 0) {
+                // Upstream server closed the connection normally.
+                break;
+            }
+
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    cerr << "Upstream receive timeout: "
+                        << host << '\n';
+                } else {
+                    perror("recv upstream");
+                }
+
+                break;
+            }
 
             string chunk(buffer, static_cast<size_t>(n));
 
