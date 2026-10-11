@@ -99,10 +99,7 @@ unordered_set<string> load_blocked_domains(const string& filename) {
     return domains;
 }
 
-bool is_domain_blocked(
-    const string& host,
-    const unordered_set<string>& blocked_domains
-) {
+bool is_domain_blocked( const string& host, const unordered_set<string>& blocked_domains ) {
     string domain = host;
 
     transform(domain.begin(), domain.end(), domain.begin(),
@@ -129,15 +126,11 @@ bool is_domain_blocked(
     return false;
 }
 
-void handle_client(
-    int client_fd,
-    const unordered_set<string>& blocked_domains
-) {
+void handle_client( int client_fd, const unordered_set<string>& blocked_domains ) {
     string request;
     char buffer[4096];
 
-    while (request.find("\r\n\r\n") == string::npos &&
-           request.size() < 16384) {
+    while (request.find("\r\n\r\n") == string::npos && request.size() < 16384) {
         ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
 
         if (n <= 0) {
