@@ -14,6 +14,10 @@
 #include <functional>
 #include <sys/time.h>
 #include <cerrno>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 using namespace std;
 
@@ -283,6 +287,29 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
 
     close(upstream_fd);
     close(client_fd);
+}
+
+queue<int> client_queue;
+mutex queue_mutex;
+condition_variable queue_cv;
+
+void worker(const unordered_set<string>& blocked_domains) {
+    while (true) {
+        int client_fd;
+
+        {
+            unique_lock<mutex> lock(queue_mutex);
+
+            queue_cv.wait(lock, [] {
+                return !client_queue.empty();
+            });
+
+            client_fd = client_queue.front();
+            client_queue.pop();
+        }
+
+        handle_client(client_fd, blocked_domains);
+    }
 }
 
 int main() {
