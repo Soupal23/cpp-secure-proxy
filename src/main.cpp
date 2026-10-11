@@ -1,5 +1,7 @@
-
 #include <iostream>
+#include <fstream>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <sstream>
 #include <unistd.h>
@@ -63,6 +65,40 @@ int connect_to_host(const string& host, const string& port) {
     return fd;
 }
 
+
+unordered_set<string> load_blocked_domains(const string& filename) {
+    unordered_set<string> domains;
+    ifstream file(filename);
+
+    if (!file.is_open()) {
+        cerr << "Could not open blocklist: " << filename << '\n';
+        return domains;
+    }
+
+    string domain;
+
+    while (getline(file, domain)) {
+        // Remove leading and trailing whitespace.
+        size_t start = domain.find_first_not_of(" \t\r\n");
+
+        if (start == string::npos) continue;
+
+        size_t end = domain.find_last_not_of(" \t\r\n");
+        domain = domain.substr(start, end - start + 1);
+
+        // Make matching case-insensitive.
+        transform(domain.begin(), domain.end(), domain.begin(),
+            [](unsigned char c) {
+                return static_cast<char>(tolower(c));
+            });
+
+        domains.insert(domain);
+    }
+
+    return domains;
+}
+
+
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -93,7 +129,9 @@ int main() {
 
     cout << "HTTP proxy listening on port 8080...\n";
 
-    unordered_set<string> blocked_domains= { "example.com" , "blocked.test" };
+    unordered_set<string> blocked_domains = load_blocked_domains("config/blocked_domains.txt");
+
+    cout << "Loaded " << blocked_domains.size() << " blocked domains\n";
 
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
@@ -142,6 +180,11 @@ int main() {
             port = host.substr(colon + 1);
             host = host.substr(0, colon);
         }
+        
+        transform(host.begin(), host.end(), host.begin(),
+            [](unsigned char c) {
+                return static_cast<char>(tolower(c));
+            });
 
         cout << method << " " << host << path << '\n';
         
