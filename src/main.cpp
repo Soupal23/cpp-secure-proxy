@@ -99,6 +99,38 @@ unordered_set<string> load_blocked_domains(const string& filename) {
 }
 
 
+bool is_domain_blocked( const string& host , const unordered_set<string>& blocked_domains) {
+    string domain = host;
+
+    transform(domain.begin(), domain.end(), domain.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(tolower(c));
+        });
+
+    while (!domain.empty() && domain.back() == '.') {
+        domain.pop_back();
+    }
+
+    size_t pos = 0;
+
+    while (true) {
+        if (blocked_domains.count(domain)) {
+            return true;
+        }
+
+        pos = domain.find('.');
+
+        if (pos == string::npos) {
+            break;
+        }
+
+        domain = domain.substr(pos + 1);
+    }
+
+    return false;
+}
+
+
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -189,7 +221,7 @@ int main() {
         cout << method << " " << host << path << '\n';
         
         string blocked_body = "Domain blocked\n";
-        if (blocked_domains.count(host)) {
+        if (is_domain_blocked(host, blocked_domains)) {
             string response =
                 "HTTP/1.1 403 Forbidden\r\n"
                 "Content-Type: text/plain\r\n"
