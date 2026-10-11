@@ -1,3 +1,4 @@
+
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -7,9 +8,11 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netdb.h>
-#include <cstring>
 #include <netinet/in.h>
 #include <unordered_set>
+#include <thread>
+#include <functional>
+
 using namespace std;
 
 bool send_all(int fd, const string& data) {
@@ -24,6 +27,7 @@ bool send_all(int fd, const string& data) {
         );
 
         if (n <= 0) return false;
+
         sent += static_cast<size_t>(n);
     }
 
@@ -65,7 +69,6 @@ int connect_to_host(const string& host, const string& port) {
     return fd;
 }
 
-
 unordered_set<string> load_blocked_domains(const string& filename) {
     unordered_set<string> domains;
     ifstream file(filename);
@@ -78,7 +81,6 @@ unordered_set<string> load_blocked_domains(const string& filename) {
     string domain;
 
     while (getline(file, domain)) {
-        // Remove leading and trailing whitespace.
         size_t start = domain.find_first_not_of(" \t\r\n");
 
         if (start == string::npos) continue;
@@ -86,7 +88,6 @@ unordered_set<string> load_blocked_domains(const string& filename) {
         size_t end = domain.find_last_not_of(" \t\r\n");
         domain = domain.substr(start, end - start + 1);
 
-        // Make matching case-insensitive.
         transform(domain.begin(), domain.end(), domain.begin(),
             [](unsigned char c) {
                 return static_cast<char>(tolower(c));
@@ -98,8 +99,10 @@ unordered_set<string> load_blocked_domains(const string& filename) {
     return domains;
 }
 
-
-bool is_domain_blocked( const string& host , const unordered_set<string>& blocked_domains) {
+bool is_domain_blocked(
+    const string& host,
+    const unordered_set<string>& blocked_domains
+) {
     string domain = host;
 
     transform(domain.begin(), domain.end(), domain.begin(),
@@ -111,18 +114,14 @@ bool is_domain_blocked( const string& host , const unordered_set<string>& blocke
         domain.pop_back();
     }
 
-    size_t pos = 0;
-
     while (true) {
         if (blocked_domains.count(domain)) {
             return true;
         }
 
-        pos = domain.find('.');
+        size_t pos = domain.find('.');
 
-        if (pos == string::npos) {
-            break;
-        }
+        if (pos == string::npos) break;
 
         domain = domain.substr(pos + 1);
     }
@@ -130,6 +129,111 @@ bool is_domain_blocked( const string& host , const unordered_set<string>& blocke
     return false;
 }
 
+void handle_client(
+    int client_fd,
+    const unordered_set<string>& blocked_domains
+) {
+    string request;
+    char buffer[4096];
+
+    while (request.find("\r\n\r\n") == string::npos &&
+           request.size() < 16384) {
+        ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
+
+        if (n <= 0) {
+            close(client_fd);
+            return;
+        }
+
+        request.append(buffer, static_cast<size_t>(n));
+    }
+
+    istringstream input(request);
+    string method, url, version;
+    input >> method >> url >> version;
+
+    if (method != "GET" || url.rfind("http://", 0) != 0) {
+        string response =
+            "HTTP/1.1 501 Not Implemented\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 0\r\n\r\n";
+
+        send_all(client_fd, response);
+        close(client_fd);
+        return;
+    }
+
+    string destination = url.substr(7);
+    size_t slash = destination.find('/');
+
+    string host = destination.substr(0, slash);
+    string path = (slash == string::npos)
+        ? "/"
+        : destination.substr(slash);
+
+    string port = "80";
+    size_t colon = host.rfind(':');
+
+    if (colon != string::npos) {
+        port = host.substr(colon + 1);
+        host = host.substr(0, colon);
+    }
+
+    transform(host.begin(), host.end(), host.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(tolower(c));
+        });
+
+    cout << method << " " << host << path << '\n';
+
+    if (is_domain_blocked(host, blocked_domains)) {
+        string body = "Domain blocked\n";
+
+        string response =
+            "HTTP/1.1 403 Forbidden\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "Content-Length: " + to_string(body.size()) +
+            "\r\n\r\n" + body;
+
+        send_all(client_fd, response);
+        close(client_fd);
+        return;
+    }
+
+    int upstream_fd = connect_to_host(host, port);
+
+    if (upstream_fd == -1) {
+        string response =
+            "HTTP/1.1 502 Bad Gateway\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 0\r\n\r\n";
+
+        send_all(client_fd, response);
+        close(client_fd);
+        return;
+    }
+
+    string upstream_request =
+        method + " " + path + " HTTP/1.1\r\n"
+        "Host: " + host + "\r\n"
+        "Connection: close\r\n\r\n";
+
+    if (send_all(upstream_fd, upstream_request)) {
+        while (true) {
+            ssize_t n = recv(upstream_fd, buffer, sizeof(buffer), 0);
+
+            if (n <= 0) break;
+
+            string chunk(buffer, static_cast<size_t>(n));
+
+            if (!send_all(client_fd, chunk)) break;
+        }
+    }
+
+    close(upstream_fd);
+    close(client_fd);
+}
 
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -161,9 +265,11 @@ int main() {
 
     cout << "HTTP proxy listening on port 8080...\n";
 
-    unordered_set<string> blocked_domains = load_blocked_domains("config/blocked_domains.txt");
+    const unordered_set<string> blocked_domains =
+        load_blocked_domains("config/blocked_domains.txt");
 
-    cout << "Loaded " << blocked_domains.size() << " blocked domains\n";
+    cout << "Loaded " << blocked_domains.size()
+         << " blocked domains\n";
 
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
@@ -173,100 +279,13 @@ int main() {
             continue;
         }
 
-        string request;
-        char buffer[4096];
+        thread client_thread(
+            handle_client,
+            client_fd,
+            cref(blocked_domains)
+        );
 
-        while (request.find("\r\n\r\n") == string::npos &&
-               request.size() < 16384) {
-            ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
-
-            if (n <= 0) break;
-
-            request.append(buffer, static_cast<size_t>(n));
-        }
-
-        istringstream input(request);
-        string method, url, version;
-        input >> method >> url >> version;
-
-        if (method != "GET" || url.rfind("http://", 0) != 0) {
-            string response =
-                "HTTP/1.1 501 Not Implemented\r\n"
-                "Connection: close\r\n"
-                "Content-Length: 0\r\n\r\n";
-
-            send_all(client_fd, response);
-            close(client_fd);
-            continue;
-        }
-
-        string destination = url.substr(7);
-        size_t slash = destination.find('/');
-        string host = destination.substr(0, slash);
-        string path = (slash == string::npos) ? "/" : destination.substr(slash);
-
-        string port = "80";
-        size_t colon = host.rfind(':');
-
-        if (colon != string::npos) {
-            port = host.substr(colon + 1);
-            host = host.substr(0, colon);
-        }
-        
-        transform(host.begin(), host.end(), host.begin(),
-            [](unsigned char c) {
-                return static_cast<char>(tolower(c));
-            });
-
-        cout << method << " " << host << path << '\n';
-        
-        string blocked_body = "Domain blocked\n";
-        if (is_domain_blocked(host, blocked_domains)) {
-            string response =
-                "HTTP/1.1 403 Forbidden\r\n"
-                "Content-Type: text/plain\r\n"
-                "Connection: close\r\n"
-                "Content-Length: "+ to_string((int)blocked_body.size()) +
-                "\r\n\r\n" + 
-                blocked_body;
-
-            send_all(client_fd, response);
-            close(client_fd);
-            continue;
-        }
-
-        int upstream_fd = connect_to_host(host, port);
-
-        if (upstream_fd == -1) {
-            string response =
-                "HTTP/1.1 502 Bad Gateway\r\n"
-                "Connection: close\r\n"
-                "Content-Length: 0\r\n\r\n";
-
-            send_all(client_fd, response);
-            close(client_fd);
-            continue;
-        }
-
-        string upstream_request =
-            method + " " + path + " HTTP/1.1\r\n"
-            "Host: " + host + "\r\n"
-            "Connection: close\r\n\r\n";
-
-        if (send_all(upstream_fd, upstream_request)) {
-            while (true) {
-                ssize_t n = recv(upstream_fd, buffer, sizeof(buffer), 0);
-
-                if (n <= 0) break;
-
-                string chunk(buffer, static_cast<size_t>(n));
-
-                if (!send_all(client_fd, chunk)) break;
-            }
-        }
-
-        close(upstream_fd);
-        close(client_fd);
+        client_thread.detach();
     }
 
     close(server_fd);
