@@ -133,7 +133,6 @@ bool is_domain_blocked( const string& host, const unordered_set<string>& blocked
     return false;
 }
 
-
 bool set_socket_timeout(int fd, int seconds) {
     timeval timeout{};
     timeout.tv_sec = seconds;
@@ -153,13 +152,18 @@ void relay_tunnel(int client_fd, int upstream_fd) {
 
     fds[0].fd = client_fd;
     fds[0].events = POLLIN;
+    fds[0].revents = 0;
 
     fds[1].fd = upstream_fd;
     fds[1].events = POLLIN;
+    fds[1].revents = 0;
+
+    bool client_eof = false;
+    bool upstream_eof = false;
 
     char buffer[8192];
 
-    while (true) {
+    while (!client_eof || !upstream_eof) {
         int result = poll(fds, 2, 30000);
 
         if (result == 0) {
@@ -177,17 +181,48 @@ void relay_tunnel(int client_fd, int upstream_fd) {
         }
 
         for (int i = 0; i < 2; i++) {
+            if (fds[i].fd == -1) {
+                continue;
+            }
+
             if (fds[i].revents & (POLLERR | POLLNVAL)) {
                 goto cleanup;
             }
 
             if (fds[i].revents & (POLLIN | POLLHUP)) {
-                int source_fd = fds[i].fd;
-                int destination_fd = fds[1 - i].fd;
+                int source_fd = (i == 0) ? client_fd : upstream_fd;
+                int destination_fd = (i == 0) ? upstream_fd : client_fd;
 
                 ssize_t n = recv(source_fd, buffer, sizeof(buffer), 0);
 
-                if (n <= 0) {
+                if (n == 0) {
+                    if (i == 0) {
+                        client_eof = true;
+                        fds[0].fd = -1;
+
+                        if (shutdown(upstream_fd, SHUT_WR) == -1 && errno != ENOTCONN) {
+                            perror("shutdown upstream");
+                            goto cleanup;
+                        }
+                    } else {
+                        upstream_eof = true;
+                        fds[1].fd = -1;
+
+                        if (shutdown(client_fd, SHUT_WR) == -1 && errno != ENOTCONN) {
+                            perror("shutdown client");
+                            goto cleanup;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+
+                    perror("recv tunnel");
                     goto cleanup;
                 }
 
@@ -198,7 +233,7 @@ void relay_tunnel(int client_fd, int upstream_fd) {
                         destination_fd,
                         buffer + sent,
                         static_cast<size_t>(n) - sent,
-                        0
+                        MSG_NOSIGNAL
                     );
 
                     if (written < 0 && errno == EINTR) {
@@ -206,6 +241,10 @@ void relay_tunnel(int client_fd, int upstream_fd) {
                     }
 
                     if (written <= 0) {
+                        if (written < 0) {
+                            perror("send tunnel");
+                        }
+
                         goto cleanup;
                     }
 
@@ -219,6 +258,7 @@ cleanup:
     close(upstream_fd);
     close(client_fd);
 }
+
 
 
 void handle_client( int client_fd, const unordered_set<string>& blocked_domains ) {
