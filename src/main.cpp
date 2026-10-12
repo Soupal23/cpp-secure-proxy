@@ -18,6 +18,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <poll.h>
 
 using namespace std;
 
@@ -147,6 +148,78 @@ bool set_socket_timeout(int fd, int seconds) {
     ) == 0;
 }
 
+void relay_tunnel(int client_fd, int upstream_fd) {
+    pollfd fds[2];
+
+    fds[0].fd = client_fd;
+    fds[0].events = POLLIN;
+
+    fds[1].fd = upstream_fd;
+    fds[1].events = POLLIN;
+
+    char buffer[8192];
+
+    while (true) {
+        int result = poll(fds, 2, 30000);
+
+        if (result == 0) {
+            cerr << "HTTPS tunnel idle timeout\n";
+            break;
+        }
+
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("poll");
+            break;
+        }
+
+        for (int i = 0; i < 2; i++) {
+            if (fds[i].revents & (POLLERR | POLLNVAL)) {
+                goto cleanup;
+            }
+
+            if (fds[i].revents & (POLLIN | POLLHUP)) {
+                int source_fd = fds[i].fd;
+                int destination_fd = fds[1 - i].fd;
+
+                ssize_t n = recv(source_fd, buffer, sizeof(buffer), 0);
+
+                if (n <= 0) {
+                    goto cleanup;
+                }
+
+                size_t sent = 0;
+
+                while (sent < static_cast<size_t>(n)) {
+                    ssize_t written = send(
+                        destination_fd,
+                        buffer + sent,
+                        static_cast<size_t>(n) - sent,
+                        0
+                    );
+
+                    if (written < 0 && errno == EINTR) {
+                        continue;
+                    }
+
+                    if (written <= 0) {
+                        goto cleanup;
+                    }
+
+                    sent += static_cast<size_t>(written);
+                }
+            }
+        }
+    }
+
+cleanup:
+    close(upstream_fd);
+    close(client_fd);
+}
+
 
 void handle_client( int client_fd, const unordered_set<string>& blocked_domains ) {
     string request;
@@ -185,7 +258,90 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     string method, url, version;
     input >> method >> url >> version;
 
-    if (method != "GET" || url.rfind("http://", 0) != 0) {
+    
+    if (method == "CONNECT") {
+        string host;
+        int port = 443;
+
+        size_t colon = url.rfind(':');
+
+        if (colon == string::npos || colon == 0 || colon == url.size() - 1) {
+            string response =
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+
+            send_all(client_fd, response);
+            close(client_fd);
+            return;
+        }
+
+        host = url.substr(0, colon);
+
+        try {
+            size_t pos;
+            int parsed_port = stoi(url.substr(colon + 1), &pos);
+
+            if (pos != url.size() - colon - 1 ||
+                parsed_port < 1 || parsed_port > 65535) {
+                throw invalid_argument("Invalid port");
+            }
+
+            port = parsed_port;
+        } catch (...) {
+            string response =
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+
+            send_all(client_fd, response);
+            close(client_fd);
+            return;
+        }
+
+        transform(host.begin(), host.end(), host.begin(),
+                [](unsigned char c) {
+                    return tolower(c);
+                });
+
+        if (is_domain_blocked(host, blocked_domains)) {
+            string response =
+                "HTTP/1.1 403 Forbidden\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+
+            send_all(client_fd, response);
+            close(client_fd);
+            return;
+        }
+
+        int upstream_fd = connect_to_host(host , to_string( port ) );
+
+        if (upstream_fd == -1) {
+            string response =
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+
+            send_all(client_fd, response);
+            close(client_fd);
+            return;
+        }
+
+        string response =
+            "HTTP/1.1 200 Connection Established\r\n\r\n";
+
+        if (!send_all(client_fd, response)) {
+            close(upstream_fd);
+            close(client_fd);
+            return;
+        }
+
+        relay_tunnel(client_fd, upstream_fd);
+        return;
+    }
+
+    if (method != "GET" || url.substr(0, 7) != "http://") {
         string response =
             "HTTP/1.1 501 Not Implemented\r\n"
             "Connection: close\r\n"
