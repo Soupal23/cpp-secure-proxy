@@ -58,7 +58,9 @@ bool send_all(int fd, const string& data) {
             data.size() - sent,
             MSG_NOSIGNAL
         );
-
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) return false;
 
         sent += static_cast<size_t>(n);
@@ -103,8 +105,13 @@ int connect_to_host(const string& host, const string& port) {
         int rc = connect(fd, p->ai_addr, p->ai_addrlen);
 
         if (rc == 0) {
-            fcntl(fd, F_SETFL, flags);
-            break;
+            if (fcntl(fd, F_SETFL, flags) != -1) {
+                break;
+            }
+
+            close(fd);
+            fd = -1;
+            continue;
         }
 
         if (errno != EINPROGRESS) {
@@ -206,13 +213,21 @@ bool set_socket_timeout(int fd, int seconds) {
     timeout.tv_sec = seconds;
     timeout.tv_usec = 0;
 
-    return setsockopt(
-        fd,
-        SOL_SOCKET,
-        SO_RCVTIMEO,
-        &timeout,
-        sizeof(timeout)
-    ) == 0;
+    if (setsockopt(
+            fd, SOL_SOCKET, SO_RCVTIMEO,
+            &timeout, sizeof(timeout)
+        ) == -1) {
+        return false;
+    }
+
+    if (setsockopt(
+            fd, SOL_SOCKET, SO_SNDTIMEO,
+            &timeout, sizeof(timeout)
+        ) == -1) {
+        return false;
+    }
+
+    return true;
 }
 
 bool set_nonblocking(int fd) {
@@ -461,7 +476,20 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     istringstream input(request);
     string method, url, version;
     input >> method >> url >> version;
+    
+    if (method.empty() || url.empty() || version.empty() ||
+        version.substr(0, 5) != "HTTP/" ||
+        (version != "HTTP/1.0" && version != "HTTP/1.1")) {
 
+        string response =
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 0\r\n\r\n";
+
+        send_all(client_fd, response);
+        close(client_fd);
+        return;
+    }
     
     if (method == "CONNECT") {
         string host;
@@ -549,7 +577,8 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
         return;
     }
 
-    if (method != "GET" || url.substr(0, 7) != "http://") {
+    if ( (method != "GET" && method != "HEAD") || url.substr(0, 7) != "http://") {
+        log_request(method, url, "ERROR");
         string response =
             "HTTP/1.1 501 Not Implemented\r\n"
             "Connection: close\r\n"
