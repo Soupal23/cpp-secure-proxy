@@ -56,7 +56,7 @@ bool send_all(int fd, const string& data) {
             fd,
             data.data() + sent,
             data.size() - sent,
-            0
+            MSG_NOSIGNAL
         );
 
         if (n <= 0) return false;
@@ -623,7 +623,7 @@ const size_t MAX_QUEUE_SIZE = 100;
 bool stopping = false;
 volatile sig_atomic_t stop_requested = 0;
 
-void handle_signal(int signal_number) {
+void handle_signal(int) {
     stop_requested = 1;
 }
 
@@ -698,10 +698,11 @@ int main() {
 
     cout << "Loaded " << blocked_domains.size()
          << " blocked domains\n";
-
+    
+    const int WORKER_COUNT = 64;
     vector<thread> workers;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < WORKER_COUNT; i++) {
         workers.emplace_back(worker, cref(blocked_domains));
     }
 

@@ -137,6 +137,7 @@ The test suite covers allowed HTTP, blocked HTTP, allowed HTTPS, unsupported HTT
 - HTTPS traffic is tunneled without TLS inspection or decryption.
 - Domain blocking is based on the requested hostname; this is not a complete enterprise-grade URL filtering or security system.
 - The implementation is an educational project and has not undergone a comprehensive security audit or production hardening.
+- The current thread-per-active-connection processing model can experience worker-pool starvation when many long-lived HTTPS tunnels remain open. An event-driven architecture using epoll is a planned improvement.
 
 ## Future Improvements
 
