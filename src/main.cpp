@@ -19,6 +19,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <poll.h>
+#include <fcntl.h>
+#include <array>
 
 using namespace std;
 
@@ -147,23 +149,97 @@ bool set_socket_timeout(int fd, int seconds) {
     ) == 0;
 }
 
+bool set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags == -1) {
+        return false;
+    }
+
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+
+
+struct PendingBuffer {
+    array<char, 16384> data;
+    size_t start = 0;
+    size_t end = 0;
+
+    size_t size() const {
+        return end - start;
+    }
+
+    size_t space() const {
+        return data.size() - end;
+    }
+
+    bool empty() const {
+        return start == end;
+    }
+
+    void consume(size_t n) {
+        start += n;
+
+        if (start == end) {
+            start = 0;
+            end = 0;
+        }
+    }
+
+    void compact() {
+        if (start > 0 && start < end) {
+            move(data.begin() + start, data.begin() + end, data.begin());
+            end -= start;
+            start = 0;
+        }
+    }
+};
+
 void relay_tunnel(int client_fd, int upstream_fd) {
-    pollfd fds[2];
+    if (!set_nonblocking(client_fd) || !set_nonblocking(upstream_fd)) {
+        perror("fcntl O_NONBLOCK");
+        close(upstream_fd);
+        close(client_fd);
+        return;
+    }
 
-    fds[0].fd = client_fd;
-    fds[0].events = POLLIN;
-    fds[0].revents = 0;
-
-    fds[1].fd = upstream_fd;
-    fds[1].events = POLLIN;
-    fds[1].revents = 0;
+    PendingBuffer to_client;
+    PendingBuffer to_upstream;
 
     bool client_eof = false;
     bool upstream_eof = false;
+    bool client_write_closed = false;
+    bool upstream_write_closed = false;
 
-    char buffer[8192];
+    while (true) {
+        if (client_eof && upstream_eof && to_client.empty() && to_upstream.empty()) {
+            break;
+        }
 
-    while (!client_eof || !upstream_eof) {
+        pollfd fds[2]{};
+
+        fds[0].fd = client_fd;
+        fds[0].events = 0;
+
+        if (!client_eof && to_upstream.space() > 0) {
+            fds[0].events |= POLLIN;
+        }
+
+        if (!to_client.empty()) {
+            fds[0].events |= POLLOUT;
+        }
+
+        fds[1].fd = upstream_fd;
+        fds[1].events = 0;
+
+        if (!upstream_eof && to_client.space() > 0) {
+            fds[1].events |= POLLIN;
+        }
+
+        if (!to_upstream.empty()) {
+            fds[1].events |= POLLOUT;
+        }
+
         int result = poll(fds, 2, 30000);
 
         if (result == 0) {
@@ -181,76 +257,100 @@ void relay_tunnel(int client_fd, int upstream_fd) {
         }
 
         for (int i = 0; i < 2; i++) {
-            if (fds[i].fd == -1) {
-                continue;
-            }
-
             if (fds[i].revents & (POLLERR | POLLNVAL)) {
                 goto cleanup;
             }
+        }
 
-            if (fds[i].revents & (POLLIN | POLLHUP)) {
-                int source_fd = (i == 0) ? client_fd : upstream_fd;
-                int destination_fd = (i == 0) ? upstream_fd : client_fd;
+        // Client -> upstream
+        if (fds[0].revents & (POLLIN | POLLHUP)) {
+            if (!client_eof && to_upstream.space() > 0) {
+                to_upstream.compact();
 
-                ssize_t n = recv(source_fd, buffer, sizeof(buffer), 0);
+                ssize_t n = recv(
+                    client_fd,
+                    to_upstream.data.data() + to_upstream.end,
+                    to_upstream.space(),
+                    0
+                );
 
-                if (n == 0) {
-                    if (i == 0) {
-                        client_eof = true;
-                        fds[0].fd = -1;
-
-                        if (shutdown(upstream_fd, SHUT_WR) == -1 && errno != ENOTCONN) {
-                            perror("shutdown upstream");
-                            goto cleanup;
-                        }
-                    } else {
-                        upstream_eof = true;
-                        fds[1].fd = -1;
-
-                        if (shutdown(client_fd, SHUT_WR) == -1 && errno != ENOTCONN) {
-                            perror("shutdown client");
-                            goto cleanup;
-                        }
-                    }
-
-                    continue;
-                }
-
-                if (n < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-
-                    perror("recv tunnel");
+                if (n > 0) {
+                    to_upstream.end += static_cast<size_t>(n);
+                } else if (n == 0) {
+                    client_eof = true;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    perror("recv client");
                     goto cleanup;
                 }
+            }
+        }
 
-                size_t sent = 0;
+        // Upstream -> client
+        if (fds[1].revents & (POLLIN | POLLHUP)) {
+            if (!upstream_eof && to_client.space() > 0) {
+                to_client.compact();
 
-                while (sent < static_cast<size_t>(n)) {
-                    ssize_t written = send(
-                        destination_fd,
-                        buffer + sent,
-                        static_cast<size_t>(n) - sent,
-                        MSG_NOSIGNAL
-                    );
+                ssize_t n = recv(
+                    upstream_fd,
+                    to_client.data.data() + to_client.end,
+                    to_client.space(),
+                    0
+                );
 
-                    if (written < 0 && errno == EINTR) {
-                        continue;
-                    }
-
-                    if (written <= 0) {
-                        if (written < 0) {
-                            perror("send tunnel");
-                        }
-
-                        goto cleanup;
-                    }
-
-                    sent += static_cast<size_t>(written);
+                if (n > 0) {
+                    to_client.end += static_cast<size_t>(n);
+                } else if (n == 0) {
+                    upstream_eof = true;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    perror("recv upstream");
+                    goto cleanup;
                 }
             }
+        }
+
+        // Flush pending bytes to client
+        if ((fds[0].revents & POLLOUT) && !to_client.empty()) {
+            ssize_t n = send(
+                client_fd,
+                to_client.data.data() + to_client.start,
+                to_client.size(),
+                MSG_NOSIGNAL
+            );
+
+            if (n > 0) {
+                to_client.consume(static_cast<size_t>(n));
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                perror("send client");
+                goto cleanup;
+            }
+        }
+
+        // Flush pending bytes to upstream
+        if ((fds[1].revents & POLLOUT) && !to_upstream.empty()) {
+            ssize_t n = send(
+                upstream_fd,
+                to_upstream.data.data() + to_upstream.start,
+                to_upstream.size(),
+                MSG_NOSIGNAL
+            );
+
+            if (n > 0) {
+                to_upstream.consume(static_cast<size_t>(n));
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                perror("send upstream");
+                goto cleanup;
+            }
+        }
+
+        // Propagate half-closes only after buffered data is sent.
+        if (client_eof && to_upstream.empty() && !upstream_write_closed) {
+            shutdown(upstream_fd, SHUT_WR);
+            upstream_write_closed = true;
+        }
+
+        if (upstream_eof && to_client.empty() && !client_write_closed) {
+            shutdown(client_fd, SHUT_WR);
+            client_write_closed = true;
         }
     }
 
@@ -258,8 +358,6 @@ cleanup:
     close(upstream_fd);
     close(client_fd);
 }
-
-
 
 void handle_client( int client_fd, const unordered_set<string>& blocked_domains ) {
     string request;
