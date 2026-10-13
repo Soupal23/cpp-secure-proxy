@@ -21,6 +21,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <array>
+#include <csignal>
 
 using namespace std;
 
@@ -588,6 +589,14 @@ mutex queue_mutex;
 condition_variable queue_cv;
 const size_t MAX_QUEUE_SIZE = 100;
 
+bool stopping = false;
+volatile sig_atomic_t stop_requested = 0;
+
+void handle_signal(int signal_number) {
+    stop_requested = 1;
+}
+
+
 void worker(const unordered_set<string>& blocked_domains) {
     while (true) {
         int client_fd;
@@ -596,8 +605,12 @@ void worker(const unordered_set<string>& blocked_domains) {
             unique_lock<mutex> lock(queue_mutex);
 
             queue_cv.wait(lock, [] {
-                return !client_queue.empty();
+                return stopping || !client_queue.empty();
             });
+
+            if (stopping) {
+                return;
+            }
 
             client_fd = client_queue.front();
             client_queue.pop();
@@ -607,7 +620,19 @@ void worker(const unordered_set<string>& blocked_domains) {
     }
 }
 
+
 int main() {
+
+    struct sigaction sa{};
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, nullptr) == -1) {
+        perror("sigaction");
+        return 1;
+    }
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (server_fd == -1) {
@@ -649,23 +674,63 @@ int main() {
         workers.emplace_back(worker, cref(blocked_domains));
     }
 
-    
-    while (true) {
+    while (!stop_requested) {
         int client_fd = accept(server_fd, nullptr, nullptr);
 
         if (client_fd == -1) {
+            if (errno == EINTR && stop_requested) {
+                break;
+            }
+
+            if (errno == EINTR) {
+                continue;
+            }
+
             perror("accept");
             continue;
         }
 
+        bool queued = false;
+
         {
             lock_guard<mutex> lock(queue_mutex);
-            client_queue.push(client_fd);
+
+            if (!stopping && client_queue.size() < MAX_QUEUE_SIZE) {
+                client_queue.push(client_fd);
+                queued = true;
+            }
         }
 
-        queue_cv.notify_one();
+        if (queued) {
+            queue_cv.notify_one();
+        } else {
+            cerr << "Queue full or shutting down; rejecting connection\n";
+            close(client_fd);
+        }
     }
 
+    // Begin shutdown.
+    {
+        lock_guard<mutex> lock(queue_mutex);
+        stopping = true;
+
+        while (!client_queue.empty()) {
+            close(client_queue.front());
+            client_queue.pop();
+        }
+    }
+
+    queue_cv.notify_all();
+
     close(server_fd);
+
+    for (thread& t : workers) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    cout << "\nProxy shut down cleanly.\n";
     return 0;
+
 }
