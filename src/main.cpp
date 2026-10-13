@@ -470,6 +470,11 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     while (request.find("\r\n\r\n") == string::npos &&
            request.size() < 16384) {
 
+        if (stop_requested) {          
+            close(client_fd);          
+            return;                    
+        }                              
+
         auto now = chrono::steady_clock::now();
         auto remaining = chrono::duration_cast<chrono::milliseconds>(
             deadline - now
@@ -493,18 +498,11 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
         int result = poll(
             &pfd,
             1,
-            static_cast<int>(remaining)
+            static_cast<int>(min<long long>(remaining, 1000))
         );
 
         if (result == 0) {
-            string response =
-                "HTTP/1.1 408 Request Timeout\r\n"
-                "Connection: close\r\n"
-                "Content-Length: 0\r\n\r\n";
-
-            send_all(client_fd, response);
-            close(client_fd);
-            return;
+            continue;
         }
 
         if (result < 0) {
@@ -732,6 +730,9 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     
     if (send_all(upstream_fd, upstream_request)) {
         while (true) {
+
+            if (stop_requested) break;
+
             ssize_t n = recv(upstream_fd, buffer, sizeof(buffer), 0);
 
             if (n == 0) {
