@@ -6,22 +6,26 @@
 [![CMake](https://img.shields.io/badge/Build-CMake-064F8C?style=for-the-badge&logo=cmake&logoColor=white)](https://cmake.org/)
 [![C++ Threads](https://img.shields.io/badge/Concurrency-C%2B%2B%20Threads-2E8B57?style=for-the-badge)](https://en.cppreference.com/w/cpp/thread.html)
 
-A multithreaded HTTP/HTTPS forward proxy built in C++17 using Linux POSIX sockets. The project explores TCP networking, concurrent client handling, domain-based access control, non-blocking I/O, and HTTPS tunneling.
+A multithreaded HTTP/HTTPS forward proxy built in C++17 using Linux POSIX sockets. It supports HTTP GET/HEAD forwarding, domain-based access control, HTTPS CONNECT tunneling, bounded connection queuing, and concurrent client handling.
+
+The project explores TCP socket programming, thread synchronization, non-blocking I/O, connection timeouts, and connection lifecycle management.
 
 ## Features
 
-- **HTTP forwarding:** Forwards supported HTTP GET and HEAD requests to upstream servers and relays responses.
+## Features
+
+- **HTTP forwarding:** Forwards supported GET and HEAD requests and relays upstream responses.
 - **HTTPS CONNECT tunneling:** Establishes TCP tunnels for HTTPS traffic without decrypting TLS payloads.
-- **Domain blocklist:** Blocks configured domains and their subdomains with an HTTP `403 Forbidden` response.
-- **Hostname normalization:** Handles hostname capitalization and trailing dots during domain checks.
+- **Domain blocklist:** Returns `403 Forbidden` for configured domains and their subdomains.
+- **Hostname normalization:** Handles case differences and trailing dots during domain matching.
 - **Worker pool:** Uses 64 worker threads to process client connections concurrently.
 - **Bounded connection queue:** Limits pending connections to 100.
-- **Buffered tunnel relay:** Uses `poll()` and non-blocking sockets to relay traffic in both directions, handling partial writes and buffered data.
-- **Connection timeout:** Uses non-blocking upstream connection establishment with `poll()` and a 5-second connection-wait timeout.
-- **Socket timeouts:** Configures receive and send timeouts for applicable blocking socket operations, plus an idle timeout for HTTPS tunnels.
-- **Graceful shutdown:** Handles `SIGINT`, closes queued connections, wakes worker threads, and joins them.
+- **Buffered tunnel relay:** Uses `poll()` and non-blocking sockets to relay data in both directions, handling partial writes and buffered data.
+- **Connection establishment timeout:** Uses non-blocking `connect()`, `poll()`, and `getsockopt(SO_ERROR)` to limit upstream connection establishment to approximately five seconds.
+- **Socket timeouts:** Configures send and receive timeouts for applicable socket operations and an idle timeout for HTTPS tunnels.
+- **Graceful shutdown:** Handles `SIGINT`, stops accepting new connections, closes queued connections, and joins worker threads. Shutdown checks in request-processing loops help workers respond to shutdown requests promptly.
 - **Request logging:** Records timestamps, destinations, and outcomes such as `ALLOWED`, `BLOCKED`, and `ERROR`.
-- **Automated smoke tests:** Tests common success and error paths using Bash and `curl`.
+- **Automated smoke tests:** Uses Bash and `curl` to test common success and error paths.
 
 ## Tech Stack
 
@@ -148,7 +152,18 @@ The smoke test suite checks:
 
 All six tests have passed in the development environment.
 
-Additional manual tests covered abrupt client disconnects, incomplete requests, invalid CONNECT ports, hostname normalization, subdomain blocking, and 20 concurrent slow clients while a legitimate request remained responsive. These are manual development checks, not a comprehensive security or load test.
+### Additional Manual Tests
+
+Development testing also covered:
+
+- Abrupt client disconnects and incomplete HTTP requests
+- Invalid CONNECT ports and malformed request lines
+- Case-insensitive hostname matching, trailing dots, and subdomain blocking
+- Twenty concurrent incomplete clients while checking responsiveness to a legitimate request
+- Shutdown with a silent client connected
+- Shutdown while an HTTP response body was still being relayed
+
+These are targeted development checks, not a comprehensive security audit or load test. Interrupting an in-progress download can result in a partial response, which is expected when the proxy closes the connection during shutdown.
 
 ## Current Limitations
 
