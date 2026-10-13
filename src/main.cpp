@@ -326,7 +326,7 @@ void relay_tunnel(int client_fd, int upstream_fd) {
             fds[1].events |= POLLOUT;
         }
 
-        int result = poll(fds, 2, 10000);
+        int result = poll(fds, 2, 1000);
 
         if (result == 0) {
             if (chrono::steady_clock::now() - last_activity >
@@ -852,6 +852,34 @@ int main() {
     }
 
     while (!stop_requested) {
+
+        pollfd server_poll{};
+        server_poll.fd = server_fd;
+        server_poll.events = POLLIN;
+
+        int ready = poll(&server_poll, 1, 1000);
+
+        if (ready == 0) {
+            continue;
+        }
+
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("poll server");
+            break;
+        }
+
+        if (stop_requested) {
+            break;
+        }
+
+        if (!(server_poll.revents & POLLIN)) {
+            continue;
+        }
+
         int client_fd = accept(server_fd, nullptr, nullptr);
 
         if (client_fd == -1) {
