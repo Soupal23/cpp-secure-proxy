@@ -22,8 +22,31 @@
 #include <fcntl.h>
 #include <array>
 #include <csignal>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 
 using namespace std;
+
+
+mutex log_mutex;
+
+void log_request(const string& method,
+                 const string& host,
+                 const string& outcome) {
+    auto now = chrono::system_clock::now();
+    time_t current_time = chrono::system_clock::to_time_t(now);
+
+    tm local_time{};
+    localtime_r(&current_time, &local_time);
+
+    lock_guard<mutex> lock(log_mutex);
+
+    cout << put_time(&local_time, "%Y-%m-%d %H:%M:%S")
+         << " [" << outcome << "] "
+         << method << " " << host << '\n';
+}
+
 
 bool send_all(int fd, const string& data) {
     size_t sent = 0;
@@ -444,6 +467,7 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
                 });
 
         if (is_domain_blocked(host, blocked_domains)) {
+            log_request("CONNECT", host + ":" + to_string(port), "BLOCKED");
             string response =
                 "HTTP/1.1 403 Forbidden\r\n"
                 "Connection: close\r\n"
@@ -457,6 +481,7 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
         int upstream_fd = connect_to_host(host , to_string( port ) );
 
         if (upstream_fd == -1) {
+            log_request("CONNECT", host + ":" + to_string(port), "ERROR");
             string response =
                 "HTTP/1.1 502 Bad Gateway\r\n"
                 "Connection: close\r\n"
@@ -475,6 +500,8 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
             close(client_fd);
             return;
         }
+        
+        log_request("CONNECT", host + ":" + to_string(port), "ALLOWED");
 
         relay_tunnel(client_fd, upstream_fd);
         return;
@@ -512,9 +539,10 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
             return static_cast<char>(tolower(c));
         });
 
-    cout << method << " " << host << path << '\n';
+    //log_request(method, host + path, "REQUEST");
 
     if (is_domain_blocked(host, blocked_domains)) {
+        log_request(method, host + path, "BLOCKED");
         string body = "Domain blocked\n";
 
         string response =
@@ -532,6 +560,7 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     int upstream_fd = connect_to_host(host, port);
 
     if (upstream_fd == -1) {
+        log_request(method, host + path, "ERROR");
         string response =
             "HTTP/1.1 502 Bad Gateway\r\n"
             "Connection: close\r\n"
@@ -548,6 +577,8 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     close(client_fd);
     return;
     }
+    
+    log_request(method, host + path, "ALLOWED");
 
     string upstream_request =
         method + " " + path + " HTTP/1.1\r\n"
