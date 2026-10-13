@@ -88,10 +88,52 @@ int connect_to_host(const string& host, const string& port) {
     for (addrinfo* p = result; p != nullptr; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
 
-        if (fd == -1) continue;
+        if (fd == -1) {
+            continue;
+        }
 
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+        int flags = fcntl(fd, F_GETFL, 0);
+
+        if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+
+        if (rc == 0) {
+            fcntl(fd, F_SETFL, flags);
             break;
+        }
+
+        if (errno != EINPROGRESS) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+
+        do {
+            rc = poll(&pfd, 1, 5000);
+        } while (rc == -1 && errno == EINTR);
+
+        if (rc > 0) {
+            int socket_error = 0;
+            socklen_t error_length = sizeof(socket_error);
+
+            if (getsockopt(
+                    fd, SOL_SOCKET, SO_ERROR,
+                    &socket_error, &error_length
+                ) == 0 && socket_error == 0) {
+
+                if (fcntl(fd, F_SETFL, flags) != -1) {
+                    break;
+                }
+            }
         }
 
         close(fd);
