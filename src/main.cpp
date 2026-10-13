@@ -28,7 +28,7 @@
 
 using namespace std;
 
-
+volatile sig_atomic_t stop_requested = 0;
 mutex log_mutex;
 
 void log_request(const string& method,
@@ -291,8 +291,13 @@ void relay_tunnel(int client_fd, int upstream_fd) {
     bool upstream_eof = false;
     bool client_write_closed = false;
     bool upstream_write_closed = false;
+    auto last_activity = chrono::steady_clock::now();
 
     while (true) {
+        if (stop_requested) {
+            break;
+        }
+
         if (client_eof && upstream_eof && to_client.empty() && to_upstream.empty()) {
             break;
         }
@@ -321,11 +326,16 @@ void relay_tunnel(int client_fd, int upstream_fd) {
             fds[1].events |= POLLOUT;
         }
 
-        int result = poll(fds, 2, 30000);
+        int result = poll(fds, 2, 10000);
 
         if (result == 0) {
-            cerr << "HTTPS tunnel idle timeout\n";
-            break;
+            if (chrono::steady_clock::now() - last_activity >
+                chrono::seconds(30)) {
+                cerr << "HTTPS tunnel idle timeout\n";
+                break;
+            }
+
+            continue;
         }
 
         if (result < 0) {
@@ -357,6 +367,7 @@ void relay_tunnel(int client_fd, int upstream_fd) {
 
                 if (n > 0) {
                     to_upstream.end += static_cast<size_t>(n);
+                    last_activity = chrono::steady_clock::now();
                 } else if (n == 0) {
                     client_eof = true;
                 } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -380,6 +391,7 @@ void relay_tunnel(int client_fd, int upstream_fd) {
 
                 if (n > 0) {
                     to_client.end += static_cast<size_t>(n);
+                    last_activity = chrono::steady_clock::now();
                 } else if (n == 0) {
                     upstream_eof = true;
                 } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -400,6 +412,7 @@ void relay_tunnel(int client_fd, int upstream_fd) {
 
             if (n > 0) {
                 to_client.consume(static_cast<size_t>(n));
+                last_activity = chrono::steady_clock::now();
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 perror("send client");
                 goto cleanup;
@@ -417,6 +430,7 @@ void relay_tunnel(int client_fd, int upstream_fd) {
 
             if (n > 0) {
                 to_upstream.consume(static_cast<size_t>(n));
+                last_activity = chrono::steady_clock::now();
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 perror("send upstream");
                 goto cleanup;
@@ -450,22 +464,82 @@ void handle_client( int client_fd, const unordered_set<string>& blocked_domains 
     return;
     }
 
-    while (request.find("\r\n\r\n") == string::npos && request.size() < 16384) {
+    
+    auto deadline = chrono::steady_clock::now() + chrono::seconds(10);
+
+    while (request.find("\r\n\r\n") == string::npos &&
+           request.size() < 16384) {
+
+        auto now = chrono::steady_clock::now();
+        auto remaining = chrono::duration_cast<chrono::milliseconds>(
+            deadline - now
+        ).count();
+
+        if (remaining <= 0) {
+            string response =
+                "HTTP/1.1 408 Request Timeout\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+
+            send_all(client_fd, response);
+            close(client_fd);
+            return;
+        }
+
+        pollfd pfd{};
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+
+        int result = poll(
+            &pfd,
+            1,
+            static_cast<int>(remaining)
+        );
+
+        if (result == 0) {
+            string response =
+                "HTTP/1.1 408 Request Timeout\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n";
+
+            send_all(client_fd, response);
+            close(client_fd);
+            return;
+        }
+
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("poll client");
+            close(client_fd);
+            return;
+        }
+
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            close(client_fd);
+            return;
+        }
+
+        if (!(pfd.revents & (POLLIN | POLLHUP))) {
+            continue;
+        }
+
         ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
 
         if (n == 0) {
-            // Client closed the connection.
             close(client_fd);
             return;
         }
 
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                cerr << "Client receive timeout\n";
-            } else {
-                perror("recv client");
+            if (errno == EINTR || errno == EAGAIN ||
+                errno == EWOULDBLOCK) {
+                continue;
             }
 
+            perror("recv client");
             close(client_fd);
             return;
         }
@@ -692,7 +766,7 @@ condition_variable queue_cv;
 const size_t MAX_QUEUE_SIZE = 100;
 
 bool stopping = false;
-volatile sig_atomic_t stop_requested = 0;
+
 
 void handle_signal(int) {
     stop_requested = 1;
