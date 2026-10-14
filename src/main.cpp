@@ -831,7 +831,7 @@ int main() {
         return 1;
     }
 
-    if (listen(server_fd, 10) == -1) {
+    if (listen(server_fd, SOMAXCONN) == -1) {
         perror("listen");
         close(server_fd);
         return 1;

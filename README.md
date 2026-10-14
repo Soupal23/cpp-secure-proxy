@@ -165,6 +165,29 @@ Development testing also covered:
 
 These are targeted development checks, not a comprehensive security audit or load test. Interrupting an in-progress download can result in a partial response, which is expected when the proxy closes the connection during shutdown.
 
+## Benchmark
+
+Measured with [wrk](https://github.com/wg/wrk) on a single machine (loopback), so the load
+generator, a local upstream server, and the proxy share the same CPU cores.
+
+- **Hardware:** [CPU model], [N] cores, WSL2 Ubuntu
+- **Build:** Release (`-DCMAKE_BUILD_TYPE=Release`), proxy output redirected to `/dev/null`
+- **Workload:** `GET` through the proxy to a local upstream; each request opens a new
+  connection (`Connection: close`). 10 s runs, median of 3.
+
+| Connections | Direct to upstream | Through proxy | p50 | p99 |
+|---|---|---|---|---|
+| 16 | 17,051 req/s | 4,985 req/s | 2.46 ms | 11.2 ms |
+| 32 | 15,150 req/s | 5,388 req/s | 4.90 ms | 15.0 ms |
+| 64 | 17,663 req/s | 5,403 req/s | 11.55 ms | 26.1 ms |
+
+Throughput plateaus at about 5.4k req/s: every request involves an accept, a queue handoff
+and a fresh upstream connection, so beyond ~32 connections extra clients only add queueing
+delay (latency ≈ connections ÷ throughput). Next steps would be an `epoll`-based event loop
+and upstream connection reuse.
+
+Reproduce with `bench/upstream.py` and `bench/proxy.lua`.
+
 ## Current Limitations
 
 - HTTP forwarding supports GET and HEAD rather than the complete set of HTTP methods.
