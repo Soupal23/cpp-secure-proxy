@@ -170,7 +170,7 @@ These are targeted development checks, not a comprehensive security audit or loa
 Measured with [wrk](https://github.com/wg/wrk) on a single machine (loopback), so the load
 generator, a local upstream server, and the proxy share the same CPU cores.
 
-- **Hardware:** [CPU model], [N] cores, WSL2 Ubuntu
+- **Hardware:** 11th Gen Intel(R) Core(TM) i3-1115G4 @ 3.00GHz, 4 cores, WSL2 Ubuntu
 - **Build:** Release (`-DCMAKE_BUILD_TYPE=Release`), proxy output redirected to `/dev/null`
 - **Workload:** `GET` through the proxy to a local upstream; each request opens a new
   connection (`Connection: close`). 10 s runs, median of 3.
